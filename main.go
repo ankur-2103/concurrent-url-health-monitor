@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -16,10 +17,29 @@ func main() {
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
+	workerCount := 5
+	if workerCount > len(os.Args)-1 {
+		workerCount = len(os.Args) - 1
+	}
+
+	urls := make(chan string)
+	var workers sync.WaitGroup
+
+	for i := 0; i < workerCount; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for url := range urls {
+				checkURL(client, logger, url)
+			}
+		}()
+	}
 
 	for _, url := range os.Args[1:] {
-		checkURL(client, logger, url)
+		urls <- url
 	}
+	close(urls)
+	workers.Wait()
 }
 
 func checkURL(client *http.Client, logger *slog.Logger, url string) {
