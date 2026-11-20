@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,11 +25,23 @@ func main() {
 
 	workerCount := flag.Int("workers", 5, "number of workers")
 	timeout := flag.Duration("timeout", 5*time.Second, "request timeout")
+	filePath := flag.String("file", "", "file containing URLs (one per line)")
 	flag.Parse()
 
-	args := flag.Args()
-	if len(args) == 0 {
-		logger.Error("provide at least one URL")
+	var targets []string
+	if *filePath != "" {
+		loaded, err := loadURLs(*filePath)
+		if err != nil {
+			logger.Error("failed to read URL file", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+		targets = loaded
+	} else {
+		targets = flag.Args()
+	}
+
+	if len(targets) == 0 {
+		logger.Error("provide at least one URL via arguments or -file")
 		os.Exit(1)
 	}
 
@@ -36,8 +50,8 @@ func main() {
 
 	client := &http.Client{Timeout: *timeout}
 	workersLimit := *workerCount
-	if workersLimit > len(args) {
-		workersLimit = len(args)
+	if workersLimit > len(targets) {
+		workersLimit = len(targets)
 	}
 	if workersLimit < 1 {
 		workersLimit = 1
@@ -72,7 +86,7 @@ func main() {
 
 	go func() {
 		defer close(urls)
-		for _, url := range args {
+		for _, url := range targets {
 			select {
 			case <-ctx.Done():
 				return
@@ -114,6 +128,25 @@ func main() {
 		slog.Int("success", success),
 		slog.Int("failed", failed),
 	)
+}
+
+func loadURLs(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var list []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		list = append(list, line)
+	}
+	return list, scanner.Err()
 }
 
 func checkURL(ctx context.Context, client *http.Client, url string) Result {

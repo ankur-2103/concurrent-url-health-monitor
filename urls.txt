@@ -1,0 +1,5 @@
+# Sample URLs for health monitoring
+https://example.com
+https://httpbin.org/status/200
+https://httpbin.org/status/404
+https://httpbin.org/delay/1
