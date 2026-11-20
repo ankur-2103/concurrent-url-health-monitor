@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,10 +11,22 @@ import (
 	"time"
 )
 
+type Result struct {
+	url        string
+	statusCode int
+	err        error
+	duration   time.Duration
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	if len(os.Args) < 2 {
+	workerCount := flag.Int("workers", 5, "number of workers")
+	timeout := flag.Duration("timeout", 5*time.Second, "request timeout")
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) == 0 {
 		logger.Error("provide at least one URL")
 		os.Exit(1)
 	}
@@ -21,16 +34,20 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	workerCount := 5
-	if workerCount > len(os.Args)-1 {
-		workerCount = len(os.Args) - 1
+	client := &http.Client{Timeout: *timeout}
+	workersLimit := *workerCount
+	if workersLimit > len(args) {
+		workersLimit = len(args)
+	}
+	if workersLimit < 1 {
+		workersLimit = 1
 	}
 
 	urls := make(chan string)
+	results := make(chan Result)
 	var workers sync.WaitGroup
 
-	for i := 0; i < workerCount; i++ {
+	for i := 0; i < workersLimit; i++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
@@ -42,51 +59,87 @@ func main() {
 					if !ok {
 						return
 					}
-					checkURL(ctx, client, logger, url)
+					res := checkURL(ctx, client, url)
+					select {
+					case <-ctx.Done():
+						return
+					case results <- res:
+					}
 				}
 			}
 		}()
 	}
 
-	for _, url := range os.Args[1:] {
-		select {
-		case <-ctx.Done():
-			close(urls)
-			workers.Wait()
-			return
-		case urls <- url:
+	go func() {
+		defer close(urls)
+		for _, url := range args {
+			select {
+			case <-ctx.Done():
+				return
+			case urls <- url:
+			}
+		}
+	}()
+
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
+
+	total := 0
+	success := 0
+	failed := 0
+
+	for res := range results {
+		total++
+		if res.err != nil {
+			failed++
+			logger.Error("URL check failed",
+				slog.String("url", res.url),
+				slog.String("error", res.err.Error()),
+				slog.Duration("duration", res.duration),
+			)
+		} else {
+			success++
+			logger.Info("URL check completed",
+				slog.String("url", res.url),
+				slog.Int("status", res.statusCode),
+				slog.Duration("duration", res.duration),
+			)
 		}
 	}
-	close(urls)
-	workers.Wait()
+
+	logger.Info("summary",
+		slog.Int("total", total),
+		slog.Int("success", success),
+		slog.Int("failed", failed),
+	)
 }
 
-func checkURL(ctx context.Context, client *http.Client, logger *slog.Logger, url string) {
+func checkURL(ctx context.Context, client *http.Client, url string) Result {
 	start := time.Now()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		logger.Error("URL check failed",
-			slog.String("url", url),
-			slog.String("error", err.Error()),
-			slog.Duration("duration", time.Since(start)),
-		)
-		return
+		return Result{
+			url:      url,
+			err:      err,
+			duration: time.Since(start),
+		}
 	}
 
 	response, err := client.Do(request)
 	if err != nil {
-		logger.Error("URL check failed",
-			slog.String("url", url),
-			slog.String("error", err.Error()),
-			slog.Duration("duration", time.Since(start)),
-		)
-		return
+		return Result{
+			url:      url,
+			err:      err,
+			duration: time.Since(start),
+		}
 	}
 	defer response.Body.Close()
 
-	logger.Info("URL check completed",
-		slog.String("url", url),
-		slog.Int("status", response.StatusCode),
-		slog.Duration("duration", time.Since(start)),
-	)
+	return Result{
+		url:        url,
+		statusCode: response.StatusCode,
+		duration:   time.Since(start),
+	}
 }
