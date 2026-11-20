@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
 	"time"
 )
@@ -15,6 +17,9 @@ func main() {
 		logger.Error("provide at least one URL")
 		os.Exit(1)
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	workerCount := 5
@@ -29,22 +34,46 @@ func main() {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for url := range urls {
-				checkURL(client, logger, url)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case url, ok := <-urls:
+					if !ok {
+						return
+					}
+					checkURL(ctx, client, logger, url)
+				}
 			}
 		}()
 	}
 
 	for _, url := range os.Args[1:] {
-		urls <- url
+		select {
+		case <-ctx.Done():
+			close(urls)
+			workers.Wait()
+			return
+		case urls <- url:
+		}
 	}
 	close(urls)
 	workers.Wait()
 }
 
-func checkURL(client *http.Client, logger *slog.Logger, url string) {
+func checkURL(ctx context.Context, client *http.Client, logger *slog.Logger, url string) {
 	start := time.Now()
-	response, err := client.Get(url)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		logger.Error("URL check failed",
+			slog.String("url", url),
+			slog.String("error", err.Error()),
+			slog.Duration("duration", time.Since(start)),
+		)
+		return
+	}
+
+	response, err := client.Do(request)
 	if err != nil {
 		logger.Error("URL check failed",
 			slog.String("url", url),
